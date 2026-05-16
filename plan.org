@@ -470,32 +470,76 @@ can be started/saved/restored as a single session by an NSM host
 (=nsm-legacy-gui=, =agordejo=, =RaySession=, ...).
 
 ** Audit current NSM compatibility
-- [ ] *st-loop* — already wires NSM Announce/Save/Open (=src/nsm.rs=,
-  =dispatcher.rs:process_save_request/process_load_request=). Audit:
-  - [ ] Does Save actually persist *audio* (WAVs per recorded sequence)
-    alongside =config.yaml=, or only metadata? The dispatcher writes
-    sequence metadata (track, beats, filename); confirm WAV bytes are
-    written and re-read correctly on a round-trip.
-  - [ ] Verify NSM Announce reply / capabilities are correct
-    (=:switch:= / =:dirty:= / =:optional-gui:= flags as appropriate).
-  - [ ] Verify the path NSM provides is honored (st-loop should write
-    *inside* the session directory, not =CWD=).
+- [X] *st-loop* — already wires NSM Announce/Save/Open (=src/nsm.rs=,
+  =dispatcher.rs:process_save_request/process_load_request=). Audit
+  findings (nsm branch):
+  - [X] *WAV persistence* — =sequence.rs:save= writes 32-bit float
+    stereo WAV via =hound= to =<session_path>/<filename>=, where
+    =filename= is =<track>-<epoch>.wav=. Load reads via =WavReader=.
+    *Round-trip bug:* =sequence.rs:load= sets =self.filename = file=
+    where =file= is the full path the dispatcher passed in
+    (=format!("{}/{}", path, item.filename)=). After load, =self.filename=
+    is the absolute path; a subsequent Save would write
+    =<path>/<full_path>=. Fix: either (a) =load= should accept
+    =(dir, basename)= and store only the basename, or (b) strip the
+    dir back off in =load=.
+  - [X] *Save guard* — =sequence.rs:save= refuses to overwrite an
+    existing file (silent return). Fine for v1 since recordings are
+    immutable, but worth a log warning, not silent.
+  - [X] *Off-by-one in scene save* — =dispatcher.rs:process_save_request=
+    iterates =0..(self.scenes.len() - 1)=, dropping the last scene. Should
+    be =0..self.scenes.len()=.
+  - [X] *Announce capabilities* — currently sent as =""=. Should advertise
+    =:switch:= (the dispatcher already supports re-Open by replacing
+    =self.path= and re-loading) and later =:optional-gui:= once GUI lands.
+    =:dirty:= requires implementing =/nsm/client/is_dirty= /
+    =/nsm/client/is_clean= broadcasts on state change — defer until
+    needed.
+  - [X] *Path honored* — yes. Save writes inside =self.path=, Load reads
+    from inside =self.path=. CWD not used. ✅
+  - [X] *Reply ordering* — =/reply= for Save and Open is sent immediately
+    after queuing the work onto the dispatcher channel, *before* the
+    work actually completes. NSM spec wants the reply *after*. Most
+    hosts tolerate this; revisit when extracting the common client.
+  - [X] *Socket model* — =std::net::UdpSocket= used inside a
+    =tokio::task::spawn=d async task (blocking =recv_from= holds the
+    runtime). Extracted version should use =tokio::net::UdpSocket=.
 - [ ] *st-conductor* — no NSM today. Needs Announce + Save/Open persisting
   tempo, time signature (and any future transport state).
 - [ ] *st-click* — no NSM today. Needs Announce + Save/Open persisting the
   selected sequence name (currently a CLI arg) and possibly the loaded YAML.
 
 ** Implementation tasks (after audit)
-- [ ] Extract common NSM client into =st-lib= (or a tiny =st-nsm= crate) so
-  st-conductor and st-click don't copy =st-loop/src/nsm.rs= verbatim.
-  Surface should be: Announce, on-Save callback, on-Open callback,
-  *plus on-Show-GUI and on-Hide-GUI callbacks* (and matching
-  =gui_is_shown= / =gui_is_hidden= responses) for =:optional-gui:=
-  support.
-- [ ] Implement NSM in st-conductor (with =:optional-gui:= capability).
-- [ ] Implement NSM in st-click (with =:optional-gui:= capability).
-- [ ] Update =st-loop/src/nsm.rs= to announce =:optional-gui:= and
-  handle Show/Hide once the looper grows its eframe GUI.
+- [X] Extract common NSM client into =st-lib= as =st_lib::nsm=.
+  Surface: =Builder::new(name).capabilities(Capabilities { switch,
+  optional_gui, dirty, ... }).launch() -> (Client, Handle)=. Events:
+  =Open { path, display_name, client_id, ack }=, =Save { ack }=,
+  =ShowGui=, =HideGui=, =SessionLoaded=, =AnnounceOk=, =AnnounceError=.
+  =Handle::{dirty, clean, gui_shown, gui_hidden, progress, message}=.
+  =Ack::{ok, err}= or drop-as-success so =/reply= follows the actual
+  completion (fixes the reply-ordering audit finding).
+  Uses =tokio::net::UdpSocket= (no blocking recv in async task).
+- [X] Implement NSM in st-conductor (capabilities =:switch::optional-gui:=).
+  Persists tempo + numerator + denominator to =<session>/conductor.yaml=.
+  CLI args are defaults; NSM Open overrides them before JACK activation.
+  Live tempo edits not yet wired (no control channel) — re-Open updates
+  the on-disk seed but doesn't disturb the running timebase.
+- [X] Implement NSM in st-click (capabilities =:switch::optional-gui:=).
+  Persists selected sequence name to =<session>/click.yaml=. Same pattern
+  as conductor: CLI default, NSM Open overrides before =jack_output=.
+- [X] Update =st-loop= to use =st_lib::nsm=. Old =st-loop/src/nsm.rs=
+  removed. Now advertises =:switch::optional-gui:=. Save/Open replies
+  are deferred until the dispatcher actually finishes the work (pending
+  =Ack= held in =Dispatcher::pending_open_ack=, completion drop on save).
+  Show/Hide handlers are stubs until the looper grows a GUI.
+
+** Bug fixes shipped on the =nsm= branch
+- [X] =sequence.rs:load= no longer stores the full path as
+  =self.filename=; basename only, so a subsequent Save targets the
+  correct file (round-trip bug from the audit).
+- [X] =dispatcher.rs:process_save_request= now iterates
+  =0..self.scenes.len()= (was =len() - 1=, silently dropped the last
+  scene).
 
 * TODOs from code audit [/]
 
