@@ -54,6 +54,15 @@ Start order: JACK → st-conductor → followers (st-click, st-loop).
 - Edits to a submodule are commits inside that submodule; the superproject
   then records the updated submodule SHA.
 - Do **not** push, force-push, or amend without explicit user request.
+- **Branch awareness.** The user frequently works in multiple branches
+  across the submodules simultaneously. The checked-out submodule SHA in
+  this superproject is *not* always the freshest code the user has in
+  mind. When something doesn't add up (a `use` references a module that
+  doesn't exist, a commit message describes code that isn't on disk,
+  etc.), assume the user is talking about a branch you haven't fetched
+  yet. Ask, or run `git -C <submodule> log --oneline --all` and
+  `git -C <submodule> branch -a` to look around before concluding the
+  tree is broken.
 
 ## Planning
 

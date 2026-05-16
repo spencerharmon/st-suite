@@ -7,6 +7,199 @@ This file tracks the forward plan for the st-suite, plus open questions and
 cleanups discovered while documenting the existing code. See [[file:AGENTS.md][AGENTS.md]] for
 the suite-level orientation.
 
+* st-click — schema, drumkv1 pairing, sequence selection [/]
+Forward plan for the metronome / polyrhythm generator. The pure-logic side
+(=Sequence::add_notes=, =get_beat_value=, =tuplet=) is already test-covered
+(=st-click/src/sequencer.rs= tests). What follows extends the YAML schema,
+nails down the drumkv1 patch this feeds into, and rationalizes how a user
+picks a sequence (CLI / GUI / NSM).
+
+** YAML schema evolution [/]
+Two additive primitives plus one structural change. All three preserve
+backward compatibility with the current shipped example.
+
+*** Add =offset= (per-note, signed, in beats) [/]
+- Field: =offset: f64= (optional, default =0.0=), measured in
+  *quarter-note beats* — independent of the entry's =beat_value=, so it
+  composes naturally with =tuplet=.
+- Semantics: applied after =skip=; conceptually shifts every emitted index
+  by =offset * frames_per_beat / 2= frames, wrapping modulo =length=.
+- Negative values legal (anticipations / push-beats).
+- Validation: reject =|offset| >= bars * beats_per_bar= at parse time.
+- Tests:
+  - quarter at =offset: 0.5= in 4/4 with =frames_per_beat=100= → frames
+    =[25, 75, 125, 175]=.
+  - negative wrap: =offset: -0.25= equals =offset: 3.75= for
+    =bars: 1, beats_per_bar: 4=.
+  - composes with =tuplet=: triplet quarter at =offset: 1.0= stays a
+    triplet, just shifted.
+
+*** Add =bars: N= per-sequence (Option A schema extension) [/]
+Currently =Sequence::new= already accepts =bars: u32= and the wrap math
+(=n_beats = beats_per_bar * bars=) is wired through, but the call site is
+hardcoded to =1= (=st-click/src/sequencer.rs:157=) and there is no YAML
+surface. Fix by promoting each sequence value from "list" to "mapping with
+optional metadata":
+
+#+begin_src yaml
+# Old form still works (implicit bars: 1):
+backbeat:
+  - { note: "C-1", beat_value: 1.0, every: 2 }
+  - { note: "D#/Eb-1", beat_value: 1.0, every: 2, skip: 1 }
+
+# New form:
+rumba_clave_4bar:
+  bars: 4
+  notes:
+    - { note: "C#/Db-1", beat_value: 16.0, offset: 0.00 }
+    - { note: "C#/Db-1", beat_value: 16.0, offset: 1.00 }
+    ...
+#+end_src
+
+Parser detects list-vs-mapping at the sequence root. Touches =config.rs=
+and the =Sequence::new(.., 1)= call site only.
+
+*** Refresh shipped example [0/2]
+- [ ] Add 6–8 curated sequences grouped by header: common / odd meter /
+  polyrhythm / multi-bar. One-line musical-intent comment per sequence
+  (not just the math).
+- [ ] Add a header block at the top of the YAML pointing at the README and
+  summarizing the schema in four lines. (The README is fine; the file
+  itself is what users edit.)
+
+*** Schema validation pass [/]
+- [ ] Reject unknown keys (typos like =beatvalue= silently no-op today).
+- [ ] Reject =offset= that wraps past the sequence span.
+- [ ] Reject negative =every= / =skip=.
+- [ ] Surface YAML parse errors with file path + line, not =unwrap()= panic.
+
+*** Implementation order
+1. =offset= primitive (purely additive; old configs unchanged).
+2. =bars: N= via Option-A schema extension.
+3. Schema validation pass (depends on the new parser structure from 2).
+4. Refresh shipped example.
+
+** drumkv1 patch / kit pairing [/]
+=st-click= emits MIDI on =st-click:midi_out=; the audible click is whatever
+synth that's wired to. The intended pair is =drumkv1= (DPF / LV2 / JACK
+drum sampler) with a small fixed kit so the YAML's note names map to
+musically appropriate sounds.
+
+*** Note-to-sample mapping (canonical kit)
+The shipped example uses =C-1=, =D#/Eb-1= (one click + one accent). For
+the expanded example library we need a slightly larger vocabulary. Propose
+a fixed mapping in =etc/st-tools/= shipped alongside the YAML:
+
+| MIDI note  | Role            | Suggested sample type           |
+|------------+-----------------+---------------------------------|
+| =C-1=      | low click       | woodblock low / kick            |
+| =C#/Db-1=  | downbeat accent | bell / cowbell                  |
+| =D-1=      | mid click       | woodblock mid / snare           |
+| =D#/Eb-1=  | secondary click | rim / clave                     |
+| =E-1=      | accent 2        | high bell                       |
+| =F-1=      | sub-click       | hat closed                      |
+| =F#/Gb-1=  | hat / shaker    | hat open / shaker               |
+| =G-1=      | spare           | (user)                          |
+
+Rationale: stays within MIDI octave -1 so it matches what already ships,
+leaves the rest of the keyboard untouched for users who want to layer
+=st-click= over a real kit.
+
+*** Deliverable: drumkv1 preset
+- [ ] Ship =etc/st-tools/st-click.drumkv1= (drumkv1's =.drumkv1=
+  preset format — XML-ish, contains the sample paths and per-pad params).
+- [ ] Source the actual sample files. Candidates:
+  - Synthesize tiny WAVs (sine click + filtered noise) at build time;
+    keeps the suite self-contained, no licensing concerns.
+  - Pull from a CC0 sample pack and vendor under =etc/st-tools/samples/=.
+  - Recommendation: *synthesize*. A 50-line Rust helper (=examples/=
+    binary?) generating the eight WAVs is more honest than vendoring
+    a sample pack, and the timbres can be tuned to be unambiguous as
+    a metronome (short, dry, pitched apart).
+- [ ] Document the wiring in =st-click/README.md=: launch drumkv1 with
+  this preset, =jack_connect st-click:midi_out drumkv1:in=, done.
+
+*** Open questions
+- [ ] Should =st-click= optionally *launch* drumkv1 itself (subprocess)
+  when not under NSM, or always assume the user / NSM did it? Lean:
+  *always assume external*. Keeps st-click a single-purpose tool.
+- [ ] Does the canonical kit go in =st-lib=, =st-click=, or its own
+  =etc/st-tools= subdir? Lean: =st-click/etc/st-tools/= alongside the YAML.
+
+** Sequence selection: CLI / GUI / NSM [/]
+Today the sequence name is a required positional CLI arg (=st-click/src/main.rs:14=)
+and the GUI combo box is read-only after launch (=st-click/src/gui/sequence_panel.rs:31=
+warns "runtime sequence swap not yet implemented"). Fix all three together.
+
+*** Make the CLI argument optional
+- =sequence_name= becomes optional. Resolution order:
+  1. Explicit CLI positional → use it.
+  2. NSM session state (if =NSM_URL= set and a saved state exists) → use it.
+  3. First sequence in the loaded YAML → use it (with a stderr note).
+  4. If YAML is empty → hard error.
+- =--no-gui= already exists; keep it.
+- Add =--list= to print sequence names and exit (handy for shell completion
+  and for sanity-checking the config file).
+
+*** Runtime sequence swap (GUI-driven)
+Currently impossible because =Sequencer::start= consumes the sequence
+name once and loops forever. Refactor:
+
+- =Sequencer= grows a =Receiver<SequencerCommand>= where
+  =SequencerCommand::SwitchTo(String)= is the only variant for v1.
+- On each iteration of the main loop, =try_recv= the command channel
+  before the JACK transport query. On =SwitchTo(name)=:
+  1. Rebuild a fresh =Sequence= from the config + new name.
+  2. Snap the playhead to the next bar boundary (using the
+     =beat_counter % beats_per_bar = 0= check already present at
+     =st-click/src/sequencer.rs:188=) so the swap is musical, not jarring.
+  3. Update =active_sequence= via a feedback channel back to the GUI.
+- GUI side: =sequence_panel::show= returns =Option<String>= when the user
+  selects a new value; =App::update= forwards it on the command channel
+  and clears the warning label.
+- Edge case: combo selection identical to active → no-op, no channel send.
+
+*** NSM save / restore
+Per the existing NSM plan section, =st-click= needs Announce + Save/Open.
+The state to persist is small:
+
+- Active sequence name.
+- (Future) any GUI-set runtime overrides (tempo trim, volume, …) — none today.
+
+Save format: a single =st-click.yaml= (different file from the *config*
+YAML — name it =session.yaml= or =state.yaml= to avoid confusion) inside
+the NSM-provided session path, containing:
+
+#+begin_src yaml
+active_sequence: seven_eight_2_2_3
+#+end_src
+
+On Open: read the file, set =active_sequence=, send =SwitchTo= into the
+sequencer command channel (same plumbing as the GUI uses). Missing file =
+fresh session, fall back to CLI/default resolution.
+
+The =:optional-gui:= capability (per the NSM section's resolved decision)
+is independent: NSM controls window visibility via Show/Hide; the sequence
+selection lives in Save/Open.
+
+*** Implementation order
+1. Refactor =Sequencer= to take a command channel; wire =SwitchTo= end-to-end
+   GUI → sequencer (drop the "not implemented" warning in =sequence_panel=).
+2. Make CLI =sequence_name= optional with the resolution order above.
+3. Add NSM Announce + Save/Open persisting =active_sequence=.
+4. Wire =:optional-gui:= Show/Hide once the shared NSM helper from the NSM
+   section lands (avoid duplicating the code path).
+
+** Cross-references
+- Schema work feeds the GUI: the sequence combo box already iterates
+  =Config::sequence_names()= (=st-click/src/gui/sequence_panel.rs:21=),
+  so =bars:= mapping form must be visible to that enumerator.
+- NSM work overlaps with the top-level [[*NSM (Non Session Manager)][NSM section]] — the shared NSM helper
+  proposed there is the right place to land st-click's Save/Open before
+  duplicating st-loop's =src/nsm.rs= a second time.
+- The existing =st-click= TODO bullets (README, schema docs) are already
+  complete; this section supersedes them with the next round of work.
+
 * GUI [/]
 A unified GUI is the next major piece of work. It will sit alongside the
 existing CLI-launched JACK clients and provide visual control/feedback for the
