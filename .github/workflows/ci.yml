@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: check + test (${{ matrix.crate }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [st-lib, st-sync, st-conductor, st-click, st-loop]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          ssh-key: ${{ secrets.SSH_DEPLOY_KEY }}
+      - name: Install JACK headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libjack-jackd2-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.crate }}
+      - name: cargo check
+        working-directory: ${{ matrix.crate }}
+        run: cargo check --all-targets
+      - name: cargo test
+        working-directory: ${{ matrix.crate }}
+        run: cargo test --all-targets

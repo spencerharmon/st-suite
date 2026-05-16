@@ -1,0 +1,20 @@
+[submodule "st-loop"]
+	path = st-loop
+	url = git@github.com:spencerharmon/st-loop.git
+	branch = dev
+[submodule "st-click"]
+	path = st-click
+	url = git@github.com:spencerharmon/st-click.git
+	branch = dev
+[submodule "st-conductor"]
+	path = st-conductor
+	url = git@github.com:spencerharmon/st-conductor.git
+	branch = dev
+[submodule "st-lib"]
+	path = st-lib
+	url = git@github.com:spencerharmon/st-lib.git
+	branch = dev
+[submodule "st-sync"]
+	path = st-sync
+	url = git@github.com:spencerharmon/st-sync.git
+	branch = dev

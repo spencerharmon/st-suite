@@ -1,0 +1,419 @@
+#+TITLE: st-suite — Plan & Open Questions
+#+AUTHOR: spencerharmon
+#+STARTUP: overview
+
+* Overview
+This file tracks the forward plan for the st-suite, plus open questions and
+cleanups discovered while documenting the existing code. See [[file:AGENTS.md][AGENTS.md]] for
+the suite-level orientation.
+
+* GUI [/]
+A unified GUI is the next major piece of work. It will sit alongside the
+existing CLI-launched JACK clients and provide visual control/feedback for the
+whole suite.
+
+** Decisions
+- *Toolkit:* =eframe= (egui), following the conventions of the
+  =qwertysynth= project. Use eframe's default glow backend unless a reason
+  to switch to wgpu appears.
+- *Reference codebase:* =./qwertysynth/src/gui/= (a sibling project, not
+  part of st-suite — being removed after the GUI plan is captured here).
+  Conventions extracted below in [[*Conventions derived from qwertysynth][Conventions derived from qwertysynth]].
+
+** Conventions derived from qwertysynth
+All adopted as the house style for st-suite GUI work unless explicitly
+overridden below.
+
+*** Crate choice & versions
+- =eframe= (not raw egui). *Pin =eframe = "0.34"= per-crate* (matches
+  qwertysynth and verified by the st-loop spike). Bump deliberately;
+  the trait surface has changed across recent versions (see below).
+- Default backend (glow). No wgpu, no =egui_extras=, no =rfd= unless a
+  concrete need appears.
+- =crossbeam-channel= for all GUI ↔ worker thread messaging.
+
+*** eframe 0.34 API specifics (learned from the st-loop spike)
+- =impl eframe::App= must define
+  =fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame)=.
+  =fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame)=
+  exists but is =#[deprecated]= in 0.34 — do *not* use it.
+- Inside =ui()=, panels are added with =.show_inside(ui, ...)=, not
+  =.show(ctx, ...)=. Use =Panel::top("id")= / =Panel::bottom("id")= /
+  =Panel::left("id")= / =Panel::right("id")=; the standalone
+  =TopBottomPanel= / =SidePanel= type aliases are deprecated.
+- The =run_native= app-builder closure must return
+  =Result<Box<dyn App>, Box<dyn Error + Send + Sync>>=. Wrap in =Ok=:
+  #+begin_src rust
+  Box::new(move |cc| {
+      cc.egui_ctx.set_visuals(egui::Visuals::dark());
+      Ok(Box::new(MyApp::new(...)))
+  })
+  #+end_src
+- Import =egui= via =use eframe::egui;= (eframe re-exports it).
+- Reference implementation: =st-loop/src/bin/gui_spike.rs= (on the
+  =dev= branch). Delete or absorb once real GUI implementation begins.
+
+*** Process / window model
+- *Single native window per process,* launched via =eframe::run_native=
+  on the main thread. Pop-out config UIs are =egui::Window= opened from
+  the central area, *not* additional OS windows.
+- =ViewportBuilder::default().with_inner_size([W, H]).with_title(...)=,
+  dark visuals (=cc.egui_ctx.set_visuals(egui::Visuals::dark())=) set
+  once at construction.
+- =main()= is synchronous. If async tasks are needed (JACK, evdev, NSM,
+  ...), construct a =tokio::runtime::Runtime= manually and =rt.spawn(...)=
+  them before calling =eframe::run_native=.
+
+*** File / module organization
+- One module per panel / widget / indicator under =src/gui/=, named by
+  suffix:
+  - =<thing>_panel.rs=    — composite interactive UI, may own a popup
+                            config window.
+  - =<thing>_widget.rs=   — larger drawable widget (custom paint, takes
+                            real estate).
+  - =<thing>_indicator.rs= — tiny status dot / lamp.
+  - =<thing>_bar.rs=      — full-width strip (info/status).
+- =gui/mod.rs= contains *only* glue: submodule decls, the =App= struct,
+  the =eframe::App= impl, the =run()= launcher, and per-frame
+  drain/dispatch helpers. *No business logic in =mod.rs=.*
+
+*** Panel / widget implementation pattern
+- *No trait, no struct-with-show.* Each module exposes free functions:
+  - Read-only:   =pub fn show(ui: &mut Ui, state: &AppState)=
+  - Interactive: =pub fn show(ui: &mut Ui, state: &mut AppState) -> R=
+    where =R= is whatever the caller needs (=bool= "needs rebuild",
+    =Option<NewValue>= for the new param to forward on a channel, ...).
+- Panels with a popup config window use the *two-function pattern*:
+  #+begin_src rust
+  pub fn show_top_bar(ui: &mut Ui, state: &mut AppState) -> bool;
+  pub fn show_config_window(ctx: &Context, state: &mut AppState) -> bool;
+  #+end_src
+  The config window takes =&Context= (not =&mut Ui=) because
+  =egui::Window= opens against the context.
+- *All widget state lives in =AppState=* — including transient flags like
+  =show_<x>_config: bool=. Widgets are pure renderers; nothing persists
+  inside them. (Rationale: everything inspectable, trivially serializable
+  later if we ever need to round-trip UI state via NSM.)
+- Give each popup =egui::Window= a stable =Id= derived from the active
+  variant (=Id::new("<panel>_window_<variant>")=) so egui doesn't lose
+  layout when the user switches modes.
+
+*** AppState pattern
+- A single =struct AppState= holds *all* app state.
+- =pub type SharedState = Arc<Mutex<AppState>>;=.
+- *The audio / JACK thread never locks =AppState=.* It owns its own
+  data and communicates exclusively via channels. The mutex exists for
+  GUI-thread + helper-task contention only.
+- For "mode" data with per-mode parameters, use an *enum-of-param-structs*:
+  one enum variant per algorithm, each carrying its own typed param
+  struct. Provide =name() -> &'static str= on the enum for labels.
+  Match the variant in both the renderer and the worker.
+
+*** GUI ↔ worker communication
+- *=crossbeam_channel::unbounded= exclusively.* No =tokio= channels in
+  the GUI <-> audio path.
+- *Push, drained by =try_recv= once per frame.* At the top of
+  =eframe::App::update=, call a =drain_<x>_events= helper that
+  =try_recv=s every relevant channel into local state under a short
+  lock, then releases the lock before drawing.
+- *Decode/translate in the worker, send high-level state to the GUI* —
+  never raw MIDI bytes or raw transport frames. e.g. the audio thread
+  decodes sustain CC 64 into a =bool= before pushing.
+- The audio / RT thread does only lock-free crossbeam sends; heavy work
+  (e.g. recomputing a wavetable, rebuilding a scene) happens on the
+  *GUI thread* and the result is pushed back as a finished value the
+  audio thread atomically swaps in.
+- =ctx.request_repaint()= at the end of every =update()= keeps the GUI
+  live so it polls channels each frame. Simple but burns CPU; if a panel
+  is idle-heavy, switch to =request_repaint_after(Duration)= or convert
+  that surface to event-driven repaints.
+
+*** Layout idioms
+- Prefer =TopBottomPanel::bottom("...")= for status strips; draw the main
+  content directly in the central area. Use =SidePanel= only when there's
+  a real reason.
+- Custom drawing: =ui.allocate_exact_size(...)= then
+  =ui.painter().rect_filled / circle_filled / rect_stroke / text=.
+- Pull colors from =ui.visuals()= (=widgets.inactive.bg_fill=,
+  =selection.bg_fill=, =text_color=) so widgets respect the theme.
+  Hardcoded RGBs allowed only for status indicators (red/green lamps).
+- Fixed sizing constants at the top of each widget file, with helper
+  fns for derived sizes.
+- =ComboBox::from_id_salt("<name>_combo")= for stable IDs.
+- Time-valued sliders: =.logarithmic(true).text("...").suffix(" s")=.
+
+*** "Needs work" return convention
+Panel/widget functions return =bool= or =Option<Value>= indicating
+whether the caller should kick off heavy work. =App::update= aggregates
+these flags and triggers the rebuild *once at the end of the frame*,
+not inline during widget rendering.
+
+*** House style
+- Tab indentation (matches qwertysynth and the rest of st-suite).
+- TODO marker style: inline =// TODO: <concrete next step>= comments
+  with actionable descriptions, not vague aspirations.
+
+** Architecture for st-suite
+
+*** Scope decision (defer — see open questions)
+Two viable shapes for the suite GUI. *Pick one before implementation*:
+- *(A) One GUI process per component.* Each of st-conductor / st-click
+  / st-loop grows its own =--gui= mode (or sibling binary) that opens
+  an eframe window owned by that process. Mirrors qwertysynth (process
+  owns both audio + GUI). Natural NSM fit: each component is one NSM
+  client with an =:optional-gui:= capability.
+- *(B) One unified GUI process.* A new =st-gui= submodule with one
+  eframe window that talks to all three running components over some
+  control bus. The components stay headless. Better single-pane-of-glass
+  UX, but adds a control protocol design problem (see next).
+
+Strong lean: *(A)* for the first cut. It matches qwertysynth, avoids
+inventing a control bus, keeps audio + GUI in the same process (so the
+GUI can use Arc<Mutex<AppState>> + crossbeam exactly as qwertysynth
+does), and gives us three small wins instead of one big one. (B) can
+be layered on top later as an additional aggregator window.
+
+*** Per-component GUI plans (assuming scope A)
+
+**** st-conductor GUI
+- Transport panel: tempo (BPM), time signature (numerator/denominator),
+  current BBT readout, transport state (Rolling / Stopped / Starting).
+- Beat indicator: a flashing dot driven by the same =next_beat_frame=
+  the conductor pushes to st-sync.
+- Optional: a sparkline of frames-per-beat over time for debugging.
+- Channels: the JACK timebase callback already updates an
+  =Arc<AtomicU64>=; add an =Arc<AtomicXxx>= or crossbeam channel for
+  current BBT / state and have the GUI poll once per frame.
+
+**** st-click GUI
+- Sequence selector: combo box listing top-level keys from the loaded
+  YAML.
+- Beat indicator: same flashing-dot pattern as the conductor, driven
+  from =st_sync::client= ticks.
+- Tempo / meter readout: read-only, mirrored from JACK transport via
+  =st_lib::jack_transport::query_transport= once per frame.
+- YAML editor (later): an =egui::TextEdit::multiline= bound to the
+  current config file with a "Reload" button.
+
+**** st-loop GUI
+- 8×8 scene/track grid (the core view). Each cell shows record/play
+  state and (later) a level meter.
+- Track strip: input gain, output level, mute / solo.
+- Scene controls: play / stop, undo, clear, go — duplicating the MIDI
+  PC vocabulary so a touch screen / mouse can drive the looper.
+- Transport readout: bar / beat from JACK transport.
+- NSM-aware: respect the path NSM provides; "dirty" flag flips on
+  state changes.
+
+*** Control / sync paths (scope A specifics)
+- *No new control protocol.* Each component's GUI talks to its own
+  audio thread via crossbeam, exactly as qwertysynth does.
+- *Cross-component awareness:* GUIs can read JACK transport (tempo /
+  BBT) via =st_lib::jack_transport= and the next-beat tick via
+  =st_sync::client::Client=. That covers most of what each GUI needs
+  to mirror the others. No bespoke RPC needed for v1.
+
+** Open questions (must resolve before implementation)
+- [X] *Confirm scope A vs scope B* — *A* (per-component GUIs). The rest
+  of this plan assumes A.
+- [X] *Where does each GUI live?* — *A1*: new =src/gui/= module inside
+  each existing submodule (=st-conductor=, =st-click=, =st-loop=).
+  Same binary; eframe runs on main thread; audio task spawned.
+- [X] *Does each GUI run by default?* — *NSM =:optional-gui:=*
+  capability is the primary mechanism: NSM toggles the GUI on/off via
+  the standard =/nsm/client/show_optional_gui= /
+  =/nsm/client/hide_optional_gui= messages, and the component must
+  reply with =/nsm/client/gui_is_shown= or =/nsm/client/gui_is_hidden=.
+  Also expose an *optional =--no-gui= CLI flag* that disables the GUI
+  entirely for headless / scripted runs (independent of NSM).
+  - Default behavior when launched by NSM: GUI hidden until NSM asks.
+  - Default behavior when launched manually (no =NSM_URL=): GUI shown
+    unless =--no-gui= is passed.
+- [X] *eframe version to pin.* *=eframe = "0.34"=* per the st-loop
+  spike. Bump deliberately; the trait API has churned recently.
+- [X] *Threading model for st-loop* — see the spike in
+  =st-loop/src/bin/gui_spike.rs= (commit on =dev= branch). The
+  qwertysynth pattern composes cleanly with st-loop's existing tokio
+  use: build a multi-thread =tokio::runtime::Runtime= manually,
+  =rt.spawn(...)= the async tasks (NSM, dispatcher, jackio), then
+  call =eframe::run_native= on the main thread. Spike verified
+  successful build with eframe 0.34 alongside tokio "full" and the
+  existing st-loop deps.
+- [ ] *Repaint cadence.* qwertysynth =request_repaint()= every frame
+  unconditionally. For the looper grid + level meters this is fine; for
+  st-conductor's mostly-static tempo display, =request_repaint_after=
+  may be friendlier. Decide per-panel.
+- [ ] *Beat indicator data source.* Two options for getting "beat
+  happened now":
+  - Each GUI runs its own =st_sync::client::Client= and pushes ticks
+    into its app state via a channel (same as st-click and st-loop
+    already do for their audio paths).
+  - The existing audio-side =Client= forwards ticks to the GUI via a
+    new crossbeam channel.
+  - Recommendation: *the latter* — don't open a second TCP connection
+    per process.
+- [ ] *Should the GUI panels be tested?* qwertysynth has none. egui has
+  =egui_kittest= for snapshot tests but it's a heavy dep. Decision:
+  *no automated GUI tests for v1*; rely on the existing pure-logic
+  test suite for the underlying state.
+
+** Implementation tasks (after the open questions are answered)
+- [ ] Pin =eframe= version; add it as a dep to each component crate.
+- [ ] Per component, create =src/gui/mod.rs= with the qwertysynth
+  glue skeleton: =App= struct, =eframe::App= impl, =run()=, drain helper.
+- [ ] Per component, define =AppState= mirroring the fields the GUI
+  needs to read.
+- [ ] Per component, add the channels feeding the GUI from the audio
+  thread.
+- [ ] Implement minimum-viable panels:
+  - st-conductor: transport_panel + beat_indicator.
+  - st-click: sequence_panel + beat_indicator.
+  - st-loop: scene_grid_widget + transport_bar.
+- [ ] Decide and wire =--gui= flag (or NSM =:optional-gui:=).
+
+* NSM (Non Session Manager) [/]
+Each st-suite component should be individually NSM-compatible so the suite
+can be started/saved/restored as a single session by an NSM host
+(=nsm-legacy-gui=, =agordejo=, =RaySession=, ...).
+
+** Audit current NSM compatibility
+- [ ] *st-loop* — already wires NSM Announce/Save/Open (=src/nsm.rs=,
+  =dispatcher.rs:process_save_request/process_load_request=). Audit:
+  - [ ] Does Save actually persist *audio* (WAVs per recorded sequence)
+    alongside =config.yaml=, or only metadata? The dispatcher writes
+    sequence metadata (track, beats, filename); confirm WAV bytes are
+    written and re-read correctly on a round-trip.
+  - [ ] Verify NSM Announce reply / capabilities are correct
+    (=:switch:= / =:dirty:= / =:optional-gui:= flags as appropriate).
+  - [ ] Verify the path NSM provides is honored (st-loop should write
+    *inside* the session directory, not =CWD=).
+- [ ] *st-conductor* — no NSM today. Needs Announce + Save/Open persisting
+  tempo, time signature (and any future transport state).
+- [ ] *st-click* — no NSM today. Needs Announce + Save/Open persisting the
+  selected sequence name (currently a CLI arg) and possibly the loaded YAML.
+
+** Implementation tasks (after audit)
+- [ ] Extract common NSM client into =st-lib= (or a tiny =st-nsm= crate) so
+  st-conductor and st-click don't copy =st-loop/src/nsm.rs= verbatim.
+  Surface should be: Announce, on-Save callback, on-Open callback,
+  *plus on-Show-GUI and on-Hide-GUI callbacks* (and matching
+  =gui_is_shown= / =gui_is_hidden= responses) for =:optional-gui:=
+  support.
+- [ ] Implement NSM in st-conductor (with =:optional-gui:= capability).
+- [ ] Implement NSM in st-click (with =:optional-gui:= capability).
+- [ ] Update =st-loop/src/nsm.rs= to announce =:optional-gui:= and
+  handle Show/Hide once the looper grows its eframe GUI.
+
+* TODOs from code audit [/]
+
+** Toolchain
+- [X] Determine whether nightly Rust is still required.
+  - All five crates now build on stable. Migrated =strict_provenance= APIs
+    (=expose_addr= → =expose_provenance=, =from_exposed_addr_mut= →
+    =with_exposed_provenance_mut=) and replaced =Vec::drain_filter= with
+    =Vec::retain=. Pinned =stable= via per-crate =rust-toolchain.toml=.
+
+** Cross-crate cleanups
+- [X] Migrate =OwnedMidi= duplication in =st-click/src/sequencer.rs= to use
+  =st_lib::owned_midi::OwnedMidi= directly. =st-click= should add =st_lib= as
+  a path dependency. - yes
+  - Done. st-click now imports =OwnedMidi=/=OwnedMidiBytes= from st_lib.
+- [X] Audit other near-duplicated types between submodules and consider
+  promoting them into =st-lib=. - yes, tell me what they are
+
+   Audit findings (strong promote candidates):
+   - [X] *JACK raw-pointer plumbing* — promoted to =st_lib::jack_ptr=
+     (=expose_client=, =recover_client=, =recover_client_mut=). Call-sites
+     in st-click and st-loop updated.
+   - [X] *JACK transport-query + BBT extraction* — promoted to
+     =st_lib::jack_transport::query_transport= returning a
+     =TransportSnapshot=. Call-sites in st-click and st-loop updated.
+   - [X] *Beat-frame math* — promoted to =st_lib::beat_math=
+     (=frames_per_beat=, =next_beat_frame=, =absolute_beat=). st-conductor's
+     =rolling.rs= now delegates; its duplicated tests moved into st-lib.
+   - [X] *XDG-ish config search path* — promoted to
+     =st_lib::config::find_config(app_name)=. st-click's =Config::new=
+     now uses it; =home= dependency dropped from st-click.
+
+   Medium / lower priority (still pending):
+   - [ ] *MIDI control vocabulary* — =st-loop/src/midi_control.rs= has
+     24 hand-written PC/Note-Off → command functions. Consolidate into a
+     table-driven module either in st-loop now or =st_lib::control_vocab=
+     when a second consumer appears.
+   - [ ] *Note-name table* — =st-click/src/note_utils.rs= owns a 130-line
+     string→=wmidi::Note= match. Promote to =st_lib::notes= once a second
+     consumer needs it.
+
+   Leave as-is: =st-click/src/beat_values.rs=,
+   =st-loop/src/constants.rs=, =st-sync= internals.
+
+** st-conductor
+- [X] Replace the raw =*mut u64= "dangerous_pointer" shared between the JACK
+  realtime callback and the async poll loop with an =Arc<AtomicU64>= (or
+  similar lock-free primitive). This would likely also remove the need for
+  =strict_provenance=. - let's talk about this after unit tests/integration tests. We need a way make sure the data is passed correctly from the callback.
+  - Done. Replaced the leaked-stack-pointer + serialized-address scheme with
+    an =Arc<AtomicU64>=. The callback now receives a boxed =TimebasePayload=
+    (numerator, denominator, tempo, =Arc<AtomicU64>=) via JACK's =arg=,
+    eliminating the per-cycle string parse and the dangling-pointer
+    footgun. Reads/writes use =Ordering::Relaxed= to match st_sync's
+    latest-wins semantics. Dropped now-unused =async-std= dep.
+- [ ] Consider exposing transport start/stop and tempo changes via a control
+  channel (see GUI section). - I don't see a need for that right now
+
+** st-sync
+- [ ] Hardcoded =127.0.0.1:6142=. Decide whether to:
+  - Keep local-only (document the assumption), or
+  - Make the bind/connect address configurable (env var or CLI flag).
+    A: local only. It's only to coordinate st-suite components on a single host.
+- [ ] Consider whether the protocol needs to carry more than =u64= frames
+  (e.g. tempo changes, transport state, control messages for the GUI).
+  A: no, I want it to stay this simple. Everything else is handled by jack and there's no need to display st-sync data in the gui. This frame-accurate sync is the main tech demo of st-suite. I think Jack should have something like this but it doesn't. Neither does pipewire afaik.
+
+** st-click
+- [X] No README; add minimal usage docs. - yes
+- [X] YAML config format isn't documented anywhere except the example file. - fix
+  - Done. README.md covers usage, config search path, full YAML schema table,
+    and the existing example.
+
+** st-loop
+- [X] No README. - fix
+  - Done. README.md covers usage, JACK ports, MIDI Program-Change vocabulary,
+    concepts, and NSM session format.
+- [X] NSM integration is st-loop-only; decide whether other components should
+  also participate so the whole suite can be saved/restored as one session.
+  - Promoted to top-level =* NSM= section above.
+
+** st-lib
+- [X] Currently exposes a stub =main.rs= ("Hello, world!"). Consider making
+  it a pure library (drop the binary target). -fix
+  - Done. =src/main.rs= removed; st-lib is now a pure library.
+
+** Testing / CI - yes. this first
+- [X] No tests, no CI. Establish a baseline:
+  - [X] =cargo check= across all submodules from the superproject
+    (GitHub Actions workflow at =.github/workflows/ci.yml=, matrix per crate).
+  - [X] Minimal unit tests for pure logic:
+    - =st-click=: =beat_values=, =note_utils=, =Sequence::add_notes=,
+      =get_beat_value= (16 tests).
+    - =st-conductor=: extracted pure helpers =frames_per_beat=,
+      =absolute_beat=, =next_beat_frame=, plus =get_incremented_bar_beat=
+      (8 tests).
+    - =st-sync=: =#[ignore]=d end-to-end roundtrip integration test
+      (binds the hardcoded port; run manually with =-- --ignored=).
+  - [X] CI provider: GitHub Actions.
+    - NOTE: Workflow expects =SSH_DEPLOY_KEY= secret in this repo for
+      submodule checkout (since submodules use SSH URLs).
+- [X] Cover the JACK realtime callback in st-conductor (data passed via
+  =*mut u64= from RT callback to async loop) — needed before refactoring
+  to =Arc<AtomicU64>=.
+  - Done by splitting the pure math (=compute_rolling_update_at=) out of
+    =jack_transport_rolling=. The function is now a thin pointer-plumbing
+    wrapper; all the arithmetic is covered by unit tests
+    (=rolling_update_*= + =st_lib::beat_math::*=).
+
+** House style (to be filled in as decisions are made)
+- [ ] Error handling: =anyhow=, =thiserror=, custom, or mix?
+- [ ] Logging: =tracing= vs. =tokio-console= vs. =println!=?
+- [ ] Commit message / branching conventions.
+- [ ] Formatting / lint config (=rustfmt.toml=, =clippy= lints).
