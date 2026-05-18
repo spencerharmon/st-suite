@@ -7,6 +7,281 @@ This file tracks the forward plan for the st-suite, plus open questions and
 cleanups discovered while documenting the existing code. See [[file:AGENTS.md][AGENTS.md]] for
 the suite-level orientation.
 
+* Timing & sync architecture — beat-window protocol [/]
+Foundational rework of the contract between st-conductor and st-sync
+clients. Triggered by an OOM crash in st-click (sized a frame-indexed
+buffer using =next_beat_frame= as if it were =frames_per_beat=, which
+only coincide when transport starts near frame 0). The deeper problem
+is that every client today re-derives timing facts (=frames_per_beat=,
+fractional beat position, etc.) from JACK transport using slightly
+different math, which drifts. Fix: make the conductor publish those
+facts authoritatively over st-sync, and refactor consumers to be
+beat-indexed rather than frame-indexed so tempo changes track
+continuously without rebuilds.
+
+** Background — what's broken today
+- *st-click crash*: =Sequence::new(beats_per_bar, next_beat_frame, 1)=
+  at =st-click/src/sequencer.rs:195= (and =:248= for runtime swaps)
+  passes =next_beat_frame= (absolute JACK sample position) where
+  =frames_per_beat= is expected. Allocates =beats_per_bar *
+  next_beat_frame * bars / 2= slots. With the conductor running for
+  even a minute before st-click connects, this is tens of millions of
+  entries; runtime sequence swaps re-allocate at ever-larger sizes.
+- *st-click ignores tempo changes entirely*: the buffer is sized once
+  at startup and never rebuilt on tempo change. Even if the value
+  above were correct, a tempo change mid-session would silently
+  desync the click from the conductor.
+- *st-click ignores meter changes entirely*: =beats_per_bar= is
+  captured once at startup; per-cycle JACK transport queries discard
+  =snap.beats_per_bar=.
+- *st-loop is partially safe*: playback is beat-counted (loop wrap is
+  driven by =observe_beat=, not by frame count), so tempo changes
+  don't break loop boundaries. But =stop_recording= uses
+  =self.beats_per_bar= captured at sequence construction
+  (=st-loop/src/sequence.rs:105=) instead of the live value from
+  =JackSyncFanoutMessage.beats_per_bar=, so meter changes mid-
+  recording round to the wrong bar length.
+- *Cross-client drift risk*: nothing forces every client to use the
+  shared =st_lib::beat_math::frames_per_beat= helper. Whenever a
+  client computes =frames_per_beat= locally from BPM + sample rate,
+  rounding differences vs. the conductor's own computation can
+  accumulate.
+
+** Protocol — sliding window of beat frames
+Replace the current single-=u64= st-sync wire format with a
+*length-prefixed window* of absolute beat frames, ordered oldest
+first:
+
+#+begin_src
+  message := u8 length, length * u64 frame
+#+end_src
+
+The window's first entry is the most recently completed beat; the
+last is the furthest-future beat the conductor has committed to.
+
+*** Contract — guarantees the conductor makes
+1. *Immutability.* Once a beat frame appears in any published
+   window, that frame is fixed forever. The conductor may not
+   retroactively change the frame position of any published beat,
+   regardless of tempo changes from any source (user, score, queue).
+2. *Monotonicity.* Beat frames are strictly increasing within a
+   window, and across windows. The transport never moves backward.
+   st-suite is a *live performance environment*; there is no
+   scrubbing, no jumping forward, no rewind. Musical repeats are
+   possible but must inherently occur at future frames.
+3. *Forward extension only.* Successive windows may add new
+   beats at the high end and drop old beats at the low end (sliding
+   forward), but never rewrite middle entries.
+
+*** Contract — what clients may assume
+- =frames_per_beat= for any pair of adjacent published beats is
+  *exact* and *agreed-on by every client*: it's just the subtraction
+  of two facts received over the wire.
+- =beat_position_at(frame)= for any frame whose surrounding beats
+  are in the window is well-defined and stable: linear interpolation
+  between adjacent published beats.
+- Beat positions inside the window will *not change*. Events
+  scheduled against the window will not drift, double-fire, or be
+  missed due to retroactive tempo updates.
+- The audio thread may snapshot or recompute beat ↔ frame
+  conversions freely without worrying about consistency.
+- The transport will never move backward. Components do not need
+  defensive code for rewind, scrub, or jump-back; if a frame from
+  the past is needed, the component is responsible for caching it
+  (e.g. st-loop already does this implicitly by recording into a
+  buffer).
+
+*** Window size
+- Default: =max(4, beats_per_bar + 1)=. A floor of 4 ensures even
+  very small meters get =prev + current + next + one extra=; a
+  ceiling of =beats_per_bar + 1= caps the commitment horizon at
+  roughly one bar so user tempo changes feel live.
+- Fixed at compile time for v1; negotiable at handshake later if
+  needed.
+
+*** Tempo change policy
+The conductor honors the immutability guarantee by deferring any
+tempo change to take effect *after the last beat already on the
+wire*. Concretely, when a new tempo is requested (user input, score
+event, queue pop):
+- *Policy 3 from design discussion*: honor the existing window;
+  stop extending it until the change's effective beat is reached,
+  then resume publication using the new tempo. Clients see the
+  window naturally shrink and re-grow.
+- *Never truncate or rewrite the published window* — that would
+  violate immutability.
+
+*** Conductor internal model
+- Build a *score-shaped* tempo envelope: =Vec<(beat_index, bpm,
+  beats_per_bar)>=. The conductor's beat-publisher consults the
+  envelope when extending the window.
+- Live user input (tap tempo, "set tempo to X") becomes an
+  append-to-end of the envelope.
+- Queue-style operation (queue a tempo change at beat N) is a
+  degenerate one-point envelope addition.
+- A future scored ritardando is a series of per-beat envelope
+  points expressing the tempo curve.
+
+The wire protocol does not distinguish these — they all reduce to
+"sequence of beat frames." The score model is the implementation
+choice; the protocol is agnostic.
+
+*** Protocol versioning
+- Single coordinated cutover for v1 (all crates in monorepo).
+- Add a *protocol version byte at connect* the moment a non-monorepo
+  consumer appears, to enable graceful handshake. Cheap insurance.
+
+** Implementation plan
+
+*** st-sync [/]
+- [ ] Bump wire format to length-prefixed window of =u64= beat
+  frames.
+- [ ] =Client::frames_per_beat() -> u64= — current_beat - prev_beat
+  from the window.
+- [ ] =Client::beat_position_at(frame: u64) -> f64= — binary search
+  the window, linear interpolation between adjacent published beats.
+- [ ] =Client::window() -> &[u64]= — raw access for clients that
+  want to walk the window themselves.
+- [ ] Keep =Client::try_recv_next_beat_frame() -> Result<u64>= as a
+  thin compatibility shim returning =window[1]= (current+1) so
+  st-loop's existing call sites keep compiling during migration.
+- [ ] Document the immutability + monotonicity + forward-extension
+  guarantees in =st-sync/README.md=.
+- [ ] Tests:
+  - [ ] Window protocol round-trip (controller → client).
+  - [ ] =beat_position_at(frame)= correctness across adjacent beats.
+  - [ ] =frames_per_beat()= changes between successive windows
+    reflect tempo changes.
+
+*** st-conductor [/]
+- [ ] Internal tempo model: =Vec<(beat_index, bpm, beats_per_bar)>=
+  score envelope.
+- [ ] Beat publisher: extends the window forward, consulting the
+  envelope at each new beat to be published. Honors immutability +
+  monotonicity.
+- [ ] Tempo change API: append-to-end of envelope; never rewrite
+  past or already-published entries.
+- [ ] When a queued change can't take effect until after the window
+  drains, stop extending the window (policy 3) rather than violate
+  immutability.
+- [ ] Tests:
+  - [ ] Immutability: feed a tempo change while the window is full,
+    assert no already-published beat frame changes.
+  - [ ] Monotonicity: scripted tempo curve, assert all published
+    beat frames are strictly increasing.
+  - [ ] Meter change: queued meter change takes effect at the
+    boundary after the window drains.
+
+*** st-click [/]
+*** beat-indexed Sequence refactor [/]
+The current frame-indexed buffer is the root cause of the OOM and
+makes continuous tempo tracking impossible. Replace with a
+beat-coordinate event list scheduled per-cycle from the live
+=frames_per_beat=.
+
+- [ ] New representation:
+  #+begin_src rust
+  struct Sequence {
+      beats_per_bar: f32,
+      bars: u32,
+      // Sorted by event_beat. (event_beat, midi_bytes)
+      events: Vec<(f64, OwnedMidiBytes)>,
+  }
+  #+end_src
+- [ ] =add_notes= and =add_notes_with_offset= produce
+  =(event_beat, bytes)= entries; never reference frames.
+- [ ] New per-cycle scheduler:
+  - Track =last_cycle_end_beat: f64= and =next_event_index: usize=.
+  - Per cycle: compute =cycle_end_beat = client.beat_position_at(
+    cycle_end_frame)=; advance cursor through events in
+    =(last_cycle_end_beat, cycle_end_beat]=; emit each with sub-
+    cycle MIDI =time= computed from the same =frames_per_beat=.
+  - Wrap cursor and =last_cycle_end_beat= when crossing
+    =bars * beats_per_bar=. Loop may wrap multiple times in one
+    cycle at very fast tempos.
+- [ ] Tests covering the four invariants and six failure modes from
+  the design discussion:
+  - [ ] Float precision: event at integer beat fires exactly once
+    across 10,000 varied-length cycles.
+  - [ ] Sequence wrap: cycle spanning multi-bar loop boundary fires
+    events on both sides.
+  - [ ] Pathologically long cycle: 10 events worth of cycle fires
+    all 10.
+  - [ ] Continuous tempo change: stepwise =frames_per_beat=
+    increments across cycles, assert per-beat hit count stays
+    correct and wall-clock spacing increases monotonically.
+  - [ ] Tempo change at cycle boundary: assert no event near the
+    boundary is missed or doubled.
+  - [ ] Late client connect: =Sequence::new= called when window's
+    first entry is at frame 4,800,000 (i.e. conductor's been
+    running). Assert buffer allocation is bounded by note count,
+    not by frame count.
+
+*** st-click integration [/]
+- [ ] Remove =Sequence::new='s =frames_per_beat= parameter (it was
+  always wrong; nothing should read it).
+- [ ] Sequencer main loop pulls =frames_per_beat= from
+  =client.frames_per_beat()= per cycle.
+- [ ] Meter change handling: per-cycle compare
+  =snap.beats_per_bar= to cached value; on change, set
+  =pending_rebuild=. Apply at next bar boundary (reuse existing
+  =pending_switch= plumbing, generalized to
+  =pending_rebuild: Option<RebuildReason>= carrying
+  ={ NameChange(String), MeterChange }=). Tempo changes need no
+  rebuild — scheduler tracks them continuously.
+
+*** st-loop [/]
+- [ ] Migrate =JackSyncFanout= to consume the new window-shaped
+  st-sync messages. Existing =JackSyncFanoutMessage= shape can
+  stay the same downstream; just populate =framerate=,
+  =next_beat_frame=, and (newly) compute =frames_per_beat= from
+  the window rather than from JACK BPM + sample rate. Eliminates
+  the future cross-client drift risk.
+- [ ] *Fix the stop-recording meter bug*: =AudioSequence= either
+  reads =beats_per_bar= from the latest =JackSyncFanoutMessage= on
+  every =stop_recording=, or updates =self.beats_per_bar= in
+  =observe_beat= from the message. The latter is cleaner — no
+  stale value can persist.
+- [ ] Test: record 3 beats in 4/4, switch conductor to 7/8, stop
+  recording, assert resulting loop length matches the new meter.
+
+*** st-lib [/]
+- [ ] Document =st_lib::beat_math::frames_per_beat= as *legacy* —
+  prefer =st_sync::Client::frames_per_beat()= for new code, which
+  agrees with the conductor by construction. Keep the helper for
+  callers that genuinely need to derive from sample rate + BPM
+  without an st-sync client (currently nobody, but the conductor
+  itself uses it internally).
+- [ ] Consider whether =st_sync::Client::beat_position_at= belongs
+  in st-lib instead of st-sync, so non-st-sync consumers can
+  reason about beats. Decision deferred until a non-st-sync
+  consumer appears.
+
+** Open questions
+- [ ] *Window-size negotiation at handshake.* Defer until a client
+  wants more lookahead than =beats_per_bar + 1=.
+- [ ] *Linear vs. higher-order interpolation in =beat_position_at=.*
+  Linear is sufficient for the metronome and looper. A future
+  dense sub-beat sequencer might want cubic or similar. Defer
+  until that consumer exists.
+- [ ] *Conductor's score model on disk.* The internal envelope is
+  in-memory for v1. NSM Save/Open would need to serialize it.
+  Deferred to st-conductor NSM work (see [[*NSM (Non Session Manager)][NSM section]]).
+- [ ] *Tap-tempo UX in the conductor GUI.* Not blocked by the
+  protocol change; can be added independently as another
+  envelope-append input.
+
+** Cross-references
+- Supersedes the prior "st-conductor TODO: refactor to
+  =Arc<AtomicU64>=" thinking now that the wire format is changing.
+- Unblocks all of [[*st-click — schema, drumkv1 pairing, sequence selection][st-click — schema, drumkv1 pairing, sequence
+  selection]]: the schema work (offset, bars, examples) becomes
+  meaningful only when the underlying engine isn't crashing or
+  silently ignoring tempo.
+- Reduces the per-component NSM work in [[*NSM (Non Session Manager)][NSM section]]: clients no
+  longer need to persist derived timing state, because the
+  conductor's score envelope is the canonical source.
+
 * st-click — schema, drumkv1 pairing, sequence selection [/]
 Forward plan for the metronome / polyrhythm generator. The pure-logic side
 (=Sequence::add_notes=, =get_beat_value=, =tuplet=) is already test-covered
