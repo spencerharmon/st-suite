@@ -64,6 +64,47 @@ Start order: JACK → st-conductor → followers (st-click, st-loop).
   `git -C <submodule> branch -a` to look around before concluding the
   tree is broken.
 
+## Build-cache / disk hygiene
+
+Rust `target/` dirs balloon fast across the suite's submodules and worktrees.
+Keep the dev loop tight:
+
+- **Lean dev debuginfo.** Each crate's (or a workspace's) root `Cargo.toml`
+  should set:
+
+  ```toml
+  [profile.dev]
+  debug = "line-tables-only"
+  ```
+
+  Panic backtraces still resolve to `file:line`; loses local-variable
+  inspection in gdb/lldb. Override per-session when debugging:
+  `CARGO_PROFILE_DEV_DEBUG=2 cargo build`. Typical `target/` shrink: 5-10×.
+
+- **sccache as `RUSTC_WRAPPER`.** Per-developer shell export, e.g.
+  `export RUSTC_WRAPPER=sccache` in `~/.bashrc`. Content-addressed,
+  concurrency-safe, shares compiles across worktrees/submodules. Inspect
+  with `sccache --show-stats`. **Do not** commit `rustc-wrapper` into
+  `.cargo/config.toml` — breaks CI / environments without sccache.
+
+- **Per-worktree `target/`, not a shared `CARGO_TARGET_DIR`.** Cargo takes
+  a build lock per target dir, so sharing serializes concurrent builds and
+  thrashes incremental caches across branches/features. Let sccache do
+  the cross-worktree sharing.
+
+- **Periodic GC** with `cargo install cargo-sweep` then
+  `cargo sweep --time 30`. Safe — sccache rehydrates on next build.
+  Manually delete unused cross-compile dirs (`target/aarch64-*/`, etc.);
+  `cargo clean -p` won't touch them.
+
+- **Scoped commands.** `cargo check -p <crate>` after edits,
+  `cargo test -p <crate>` before committing that crate,
+  `cargo build/test --workspace --all-features` only pre-push.
+
+- **Don't** set `codegen-units = 1` or disable incremental in dev, and
+  don't `--no-verify` / skip lints to paper over slow loops — fix the
+  root cost.
+
 ## Planning
 
 Active design notes, the GUI plan, and open TODOs live in
